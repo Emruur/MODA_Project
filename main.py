@@ -7,10 +7,9 @@ from pymoo.core.sampling import Sampling
 from pymoo.core.crossover import Crossover
 from pymoo.core.mutation import Mutation
 import matplotlib.pyplot as plt
+import matplotlib.animation as animation
 
 # --- Data Reading & Preprocessing ---
-import numpy as np
-
 def generate_feasible_vrptw(n_customers=20, less_pref_pad=10, seed=42):
     rng = np.random.default_rng(seed)
     n = n_customers
@@ -51,49 +50,6 @@ def generate_feasible_vrptw(n_customers=20, less_pref_pad=10, seed=42):
     nodes = np.array(nodes)
 
     return nodes, dmat, p, w_pref, w_less
-
-# Example usage in your framework:
-nodes, dmat, p, w_pref, w_less = generate_feasible_vrptw(n_customers=20, less_pref_pad=30, seed=123)
-# Now plug these directly into yo
-
-def parse_solomon(path, n_customers=3):
-    """
-    Parse Solomon data but only read the depot + first `n_customers` customers.
-    """
-    with open(path, 'r') as f:
-        lines = f.readlines()
-    cust_start = next(i for i, l in enumerate(lines) if l.strip().startswith('CUST'))
-    lines = lines[cust_start + 1:]
-    nodes = []
-    for line in lines:
-        if line.strip() == '':
-            continue
-        parts = line.split()
-        if len(parts) != 7: continue
-        nodes.append(tuple(map(float, parts)))
-        # First line is depot, then customers. Stop after n_customers+1 lines (including depot)
-        if len(nodes) >= n_customers + 1:
-            break
-    return np.array(nodes)
-
-def build_vrptw_data(nodes, less_pref_pad=90):
-    # nodes: n+1 x 7 array (depot + n customers)
-    n = len(nodes) - 1
-    x = nodes[:,1]
-    y = nodes[:,2]
-    p = nodes[:,6]
-    w_pref = np.stack([nodes[:,4], nodes[:,5]], axis=1)  # preferred time windows
-
-    # less preferred: extend both ends, except depot
-    w_less = w_pref.copy()
-    w_less[1:,0] = np.maximum(0, w_pref[1:,0] - less_pref_pad)
-    w_less[1:,1] = w_pref[1:,1] + less_pref_pad
-
-    # Distances for travel time (euclidean)
-    coords = np.stack([x,y], axis=1)
-    dmat = np.linalg.norm(coords[:,None,:] - coords[None,:,:], axis=2)
-
-    return n, dmat, p, w_pref, w_less
 
 # --- Custom Problem Class ---
 
@@ -255,8 +211,9 @@ class PermBinaryMutation(Mutation):
 
 if __name__ == '__main__':
     # --- 1. Data ---
-    n = 30
+    n = 10 # Reduced for better visualization of individual routes
     nodes, dmat, p, w_pref, w_less = generate_feasible_vrptw(n_customers=n, less_pref_pad=30, seed=123)
+    coords = nodes[:, 1:3] # Extract coordinates for plotting
 
     # --- 2. Problem and Operators ---
     problem = VRPTWPermBinary(n, dmat, p, w_pref, w_less)
@@ -265,7 +222,7 @@ if __name__ == '__main__':
     mutation = PermBinaryMutation(n, pm=0.2)
 
     algorithm = NSGA2(
-        pop_size=200,
+        pop_size=100,
         sampling=sampling,
         crossover=crossover,
         mutation=mutation,
@@ -274,94 +231,244 @@ if __name__ == '__main__':
     )
 
     # --- 3. Optimize and track Hypervolume ---
-    n_gen = 1500
-    hv = HV(ref_point=np.array([n, 5000]))  # ref: all less pref, big time
+    n_gen = 500 # Reduced generations for faster execution
+    hv = HV(ref_point=np.array([n+1, 1e4]))  # ref: all less pref, big time
     hv_history = []
-pareto_history = []
+    pareto_history = []
 
-# Set your reference point larger than any expected [objective1, objective2]
-hv = HV(ref_point=np.array([n+1, 1e4]))
-
-def callback(algorithm):
-    F = algorithm.pop.get("F")
-    if F is not None and len(F) > 0:
-        feasible = (algorithm.pop.get("CV") <= 0).flatten()
-        front = F[feasible]
-        if front.shape[0] > 0:
-            from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
-            nd_fronts = NonDominatedSorting().do(front)
-            pareto_front = front[nd_fronts[0]]
-            pareto_history.append(pareto_front)
-            hv_val = hv(pareto_front)
+    def callback(algorithm):
+        F = algorithm.pop.get("F")
+        if F is not None and len(F) > 0:
+            feasible = (algorithm.pop.get("CV") <= 0).flatten()
+            front = F[feasible]
+            if front.shape[0] > 0:
+                from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
+                nd_fronts = NonDominatedSorting().do(front)
+                pareto_front = front[nd_fronts[0]]
+                # Store the actual solutions (X) along with objectives (F)
+                pareto_solutions_X = algorithm.pop[feasible][nd_fronts[0]].get("X")
+                pareto_history.append((pareto_front, pareto_solutions_X))
+                hv_val = hv(pareto_front)
+            else:
+                pareto_history.append((np.empty((0, F.shape[1])), np.empty((0, problem.n_var))))
+                hv_val = 0.0
+            hv_history.append(hv_val)
         else:
-            pareto_front = np.empty((0, F.shape[1]))
-            pareto_history.append(pareto_front)
-            hv_val = 0.0
-        hv_history.append(hv_val)
-    else:
-        pareto_history.append(np.empty((0, 2)))
-        hv_history.append(0.0)
+            pareto_history.append((np.empty((0, 2)), np.empty((0, problem.n_var))))
+            hv_history.append(0.0)
 
-res = minimize(
-    problem,
-    algorithm,
-    ("n_gen", n_gen),
-    seed=42,
-    verbose=True,
-    callback=callback
-)
+    res = minimize(
+        problem,
+        algorithm,
+        ("n_gen", n_gen),
+        seed=42,
+        verbose=True,
+        callback=callback
+    )
 
-# --- Plot hypervolume progress (final curve) ---
-plt.figure()
-plt.plot(hv_history)
-plt.xlabel("Generation")
-plt.ylabel("Hypervolume")
-plt.title("NSGA-II Hypervolume Progress")
-plt.savefig("hv_progress.png", dpi=200)
-
-# --- Plot final Pareto front ---
-if res.F is not None:
+    # --- Plot hypervolume progress (final curve) ---
     plt.figure()
-    plt.scatter(res.F[:,0], res.F[:,1])
-    plt.xlabel("Number of less preferred slots")
-    plt.ylabel("Total route time")
-    plt.title("Final Pareto front")
-    plt.savefig("final_pareto.png", dpi=200)
+    plt.plot(hv_history)
+    plt.xlabel("Generation")
+    plt.ylabel("Hypervolume")
+    plt.title("NSGA-II Hypervolume Progress")
+    plt.savefig("hv_progress.png", dpi=200)
+
+    # --- Plot final Pareto front ---
+    if res.F is not None:
+        plt.figure()
+        plt.scatter(res.F[:,0], res.F[:,1])
+        plt.xlabel("Number of less preferred slots")
+        plt.ylabel("Total route time")
+        plt.title("Final Pareto front")
+        plt.savefig("final_pareto.png", dpi=200)
 
 
-# --- Animated video: left=Pareto, right=HV progress ---
-import matplotlib.animation as animation
+    if res.F is not None and len(res.F) > 0:
+        final_front = res.F
+        final_solutions = res.X
 
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10,5))
-max_x = max([front[:,0].max() if len(front)>0 else 0 for front in pareto_history]) + 1
-max_y = max([front[:,1].max() if len(front)>0 else 0 for front in pareto_history]) + 10
-max_hv = max(hv_history)*1.05
+        # Sort the final front by the first objective (less preferred slots)
+        sort_indices = np.argsort(final_front[:, 0])
+        sorted_front = final_front[sort_indices]
+        sorted_solutions = final_solutions[sort_indices]
 
-def update(frame):
-    ax1.clear()
-    ax2.clear()
-    # Pareto front
-    ax1.set_xlim(0, max_x)
-    ax1.set_ylim(0, max_y)
-    ax1.set_xlabel("Number of less preferred slots")
-    ax1.set_ylabel("Total route time")
-    ax1.set_title(f"Pareto Front - Generation {frame+1}")
-    front = pareto_history[frame]
-    if len(front) > 0:
-        ax1.scatter(front[:,0], front[:,1], color='red')
-    # HV progress
-    ax2.set_xlim(0, len(hv_history))
-    ax2.set_ylim(0, max_hv)
-    ax2.set_xlabel("Generation")
-    ax2.set_ylabel("Hypervolume")
-    ax2.set_title("HV Progress")
-    ax2.plot(hv_history[:frame+1], color='blue')
-    ax2.scatter([frame], [hv_history[frame]], color='red')
-    return []
+        # --- Select Four Solutions ---
+        selected_solutions_info = []
 
-n_frames = len(pareto_history)
-interval_ms = 10000 / n_frames  # 10 seconds total duration
+        # 1. Solution with minimum less preferred slots (edge 1)
+        sol_min_less_pref_X = sorted_solutions[0]
+        sol_min_less_pref_F = sorted_front[0]
+        selected_solutions_info.append(
+            ("Min Less Preferred Slots", sol_min_less_pref_X, sol_min_less_pref_F, 'red')
+        )
 
-ani = animation.FuncAnimation(fig, update, frames=n_frames, interval=interval_ms, blit=False)
-ani.save("pareto_with_hv.mp4", writer='ffmpeg', dpi=200)
-print("Saved animation as pareto_with_hv.mp4")
+        # 2. Solution with minimum total route time (edge 2)
+        idx_min_time_among_sorted = np.argmin(sorted_front[:, 1])
+        sol_min_time_X = sorted_solutions[idx_min_time_among_sorted]
+        sol_min_time_F = sorted_front[idx_min_time_among_sorted]
+        selected_solutions_info.append(
+            ("Min Total Route Time", sol_min_time_X, sol_min_time_F, 'blue')
+        )
+
+        # 3. Two solutions from the middle
+        num_solutions = len(sorted_solutions)
+        all_selected_indices = {0, idx_min_time_among_sorted}
+        candidates = [i for i in range(num_solutions) if i not in all_selected_indices]
+        mid_idx_1 = None
+        mid_idx_2 = None
+
+        if len(candidates) >= 2:
+            mid_idx_1 = candidates[len(candidates)//3]
+            mid_idx_2 = candidates[(2*len(candidates))//3]
+            if mid_idx_1 == mid_idx_2 and len(candidates) > 1: # Ensure distinct
+                mid_idx_2 = candidates[min(len(candidates)-1, candidates.index(mid_idx_1) + 1)]
+        elif len(candidates) == 1:
+            mid_idx_1 = candidates[0]
+
+        if mid_idx_1 is not None:
+            sol_middle_1_X = sorted_solutions[mid_idx_1]
+            sol_middle_1_F = sorted_front[mid_idx_1]
+            selected_solutions_info.append(
+                ("Middle Solution 1", sol_middle_1_X, sol_middle_1_F, 'green')
+            )
+        if mid_idx_2 is not None:
+            sol_middle_2_X = sorted_solutions[mid_idx_2]
+            sol_middle_2_F = sorted_front[mid_idx_2]
+            selected_solutions_info.append(
+                ("Middle Solution 2", sol_middle_2_X, sol_middle_2_F, 'purple')
+            )
+
+        selected_solutions_info = selected_solutions_info[:4]
+
+
+        # Generate circular coordinates for visualization
+        viz_coords = np.zeros((n + 1, 2))
+        radius = 10 # Adjust as needed
+        for i in range(n):
+            angle = 2 * np.pi * i / n
+            viz_coords[i+1, 0] = radius * np.cos(angle)
+            viz_coords[i+1, 1] = radius * np.sin(angle)
+
+        # --- Plotting in a Grid ---
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12)) # 2x2 grid, larger figure
+        axes = axes.flatten() # Flatten the 2x2 array of axes for easy iteration
+
+        for i, (label, sol_X, sol_F, color) in enumerate(selected_solutions_info):
+            ax = axes[i] # Get the current subplot
+            perm = sol_X[:n].astype(int)
+
+            # Add 1 to permutation elements for display in title (to match 1-based customer labels)
+            perm_for_display = perm + 1
+            N_DISPLAY = 15 # Number of elements to display from X
+            perm_str = str(perm_for_display[:N_DISPLAY])
+            b_str = str(sol_X[n:][:N_DISPLAY])
+            if n > N_DISPLAY:
+                perm_str = perm_str[:-1] + ',...]'
+                b_str = b_str[:-1] + ',...]'
+
+            # Title includes solution type, objectives, and (truncated) X array
+            ax.set_title(f"{label}\nF=[{sol_F[0]:.0f}, {sol_F[1]:.1f}] Binary={b_str}", fontsize=10)
+
+            # Plot nodes on current subplot (Depot is at 0,0, no offset applied here)
+            ax.scatter(viz_coords[0, 0], viz_coords[0, 1],
+                    marker='s', color='black', s=100, label='Depot (0)', zorder=4)
+
+            for j in range(1, n + 1):
+                ax.scatter(viz_coords[j, 0], viz_coords[j, 1], marker='o', color='grey', s=60, zorder=3)
+                ax.text(viz_coords[j, 0] + 0.5, viz_coords[j, 1] + 0.5, str(j), fontsize=8, ha='center', va='center')
+
+
+            # Plot route segments for this solution (lines will go to/from exact center of depot)
+            current_route_nodes_indices = [0] + list(perm + 1) + [0] # List of viz_coords indices for the route
+
+            for k in range(len(current_route_nodes_indices) - 1):
+                start_node_idx = current_route_nodes_indices[k]
+                end_node_idx = current_route_nodes_indices[k+1]
+
+                start_coords = viz_coords[start_node_idx]
+                end_coords = viz_coords[end_node_idx]
+
+                # No adjustment for start/end points when connecting to depot, they go directly to its center
+                ax.annotate("",
+                            xy=end_coords, xycoords='data',
+                            xytext=start_coords, textcoords='data',
+                            arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=0.0",
+                                            color=color, linestyle='-', lw=1.5),
+                            zorder=2
+                        )
+            ax.set_xlabel("X Coordinate")
+            ax.set_ylabel("Y Coordinate")
+            ax.grid(True, linestyle='--', alpha=0.6)
+            ax.set_aspect('equal', adjustable='box') # Keep aspect ratio for circular layout
+
+        plt.tight_layout() # Adjust layout to prevent overlaps
+        plt.savefig("four_separate_solutions_circular_centered_depot.png", dpi=300)
+        plt.show()
+
+    else:
+        print("No feasible solutions found to plot individual routes.")
+        # Retrieve the last stored Pareto front for animation if the final result has no solutions
+        if res.F is None or len(res.F) == 0:
+            if len(pareto_history) > 0:
+                last_valid_front, _ = pareto_history[-1]
+                if last_valid_front.shape[0] > 0:
+                    res.F = last_valid_front
+            else:
+                print("No Pareto history to create animation.")
+                exit()
+
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10,5))
+    # Adjust max_x and max_y based on actual F values
+    all_F_values = []
+    for front_tuple in pareto_history:
+        if front_tuple[0].shape[0] > 0:
+            all_F_values.extend(front_tuple[0].tolist())
+    all_F_values = np.array(all_F_values)
+
+    max_x = all_F_values[:,0].max() * 1.1 if all_F_values.shape[0] > 0 else n + 1
+    max_y = all_F_values[:,1].max() * 1.1 if all_F_values.shape[0] > 0 else 5000
+    min_x = all_F_values[:,0].min() * 0.9 if all_F_values.shape[0] > 0 else -1
+    min_y = all_F_values[:,1].min() * 0.9 if all_F_values.shape[0] > 0 else -1
+
+    max_hv = max(hv_history)*1.05 if len(hv_history) > 0 else 1.0
+
+
+    def update(frame):
+        ax1.clear()
+        ax2.clear()
+
+        # Pareto front
+        ax1.set_xlim(min_x, max_x)
+        ax1.set_ylim(min_y, max_y)
+        ax1.set_xlabel("Number of less preferred slots")
+        ax1.set_ylabel("Total route time")
+        ax1.set_title(f"Pareto Front - Generation {frame+1}")
+        current_front, _ = pareto_history[frame]
+        if len(current_front) > 0:
+            ax1.scatter(current_front[:,0], current_front[:,1], color='red')
+        else:
+            ax1.text(0.5, 0.5, "No feasible solutions", transform=ax1.transAxes, ha='center')
+
+        # HV progress
+        ax2.set_xlim(0, len(hv_history))
+        ax2.set_ylim(0, max_hv)
+        ax2.set_xlabel("Generation")
+        ax2.set_ylabel("Hypervolume")
+        ax2.set_title("HV Progress")
+        if frame < len(hv_history):
+            ax2.plot(hv_history[:frame+1], color='blue')
+            ax2.scatter([frame], [hv_history[frame]], color='red')
+        else:
+            ax2.text(0.5, 0.5, "No HV data", transform=ax2.transAxes, ha='center')
+        return []
+
+    n_frames = len(pareto_history)
+    if n_frames > 0:
+        interval_ms = 10000 / n_frames  # 10 seconds total duration
+        ani = animation.FuncAnimation(fig, update, frames=n_frames, interval=interval_ms, blit=False)
+        ani.save("pareto_with_hv.mp4", writer='ffmpeg', dpi=200)
+        print("Saved animation as pareto_with_hv.mp4")
+    else:
+        print("Not enough frames for animation.")
